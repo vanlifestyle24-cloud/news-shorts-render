@@ -68,11 +68,18 @@ jobs:
             EXT="jpg"
           fi
 
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
           while IFS= read -r url; do
             i=$((i+1))
             n=$(printf '%03d' "$i")
             echo "Downloading media $n: $url"
-            curl -L -f -s "$url" -o "media/item_${n}.${EXT}" || echo "  (failed, skipping)"
+            http_code=$(curl -L -sS --retry 3 --retry-delay 2 -A "$UA" \
+              -o "media/item_${n}.${EXT}" -w "%{http_code}" "$url" || echo "000")
+            if [ "$http_code" != "200" ]; then
+              echo "  FAILED (HTTP $http_code) - skipping media $n"
+              rm -f "media/item_${n}.${EXT}"
+            fi
           done < <(jq -r '.[]' media.json)
 
           # remove any empty/failed downloads
@@ -80,8 +87,8 @@ jobs:
 
           COUNT=$(ls media/item_*.${EXT} 2>/dev/null | wc -l)
           if [ "$COUNT" -eq 0 ]; then
-            echo "No media downloaded successfully, falling back to a still image"
-            curl -L "https://picsum.photos/1080/1920" -o media/item_001.jpg
+            echo "::warning::ALL media downloads failed - falling back to an UNRELATED random placeholder image. Check the HTTP codes logged above."
+            curl -L -A "$UA" "https://picsum.photos/1080/1920" -o media/item_001.jpg
             MEDIA_TYPE="image"
             COUNT=1
           fi

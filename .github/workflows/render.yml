@@ -23,6 +23,10 @@ on:
         description: 'Comma separated tags'
         required: false
         default: 'news,shorts,uk'
+      privacy_status:
+        description: 'YouTube privacy status (private/unlisted/public)'
+        required: false
+        default: 'private'
 
 jobs:
   render-and-upload:
@@ -59,6 +63,7 @@ jobs:
           VIDEO_TITLE: ${{ github.event.inputs.video_title }}
           VIDEO_DESCRIPTION: ${{ github.event.inputs.video_description }}
           VIDEO_TAGS: ${{ github.event.inputs.video_tags }}
+          PRIVACY_STATUS: ${{ github.event.inputs.privacy_status }}
         run: |
           pip install --quiet google-auth google-auth-oauthlib google-api-python-client
           python3 upload_youtube.py

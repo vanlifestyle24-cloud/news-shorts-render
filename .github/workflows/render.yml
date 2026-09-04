@@ -35,8 +35,8 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install fonts
-        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
+      - name: Install fonts and ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core ffmpeg
 
       - name: Download assets
         run: |

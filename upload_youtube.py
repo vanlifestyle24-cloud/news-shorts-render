@@ -15,6 +15,29 @@ HASHTAGS_TEXT = os.environ.get("HASHTAGS_TEXT", "#news #uk #shorts").strip()
 RAW_TAGS = os.environ.get("VIDEO_TAGS", "")
 PRIVACY_STATUS = os.environ.get("PRIVACY_STATUS", "private")
 
+# Set by the "Detect media orientation" step in render.yml. IS_SHORT is the
+# real signal: YouTube itself decides Shorts vs normal video purely from the
+# video's aspect ratio (vertical/square) and length - there's no API field
+# to force it - so all we control here is keeping the #shorts tag honest:
+# only claim "shorts" when the render actually came out vertical.
+ORIENTATION = os.environ.get("ORIENTATION", "portrait").strip().lower()
+IS_SHORT = os.environ.get("IS_SHORT", "true").strip().lower() == "true"
+
+
+def strip_shorts_word(text):
+    # remove any standalone "shorts"/"#shorts" token (case-insensitive)
+    text = re.sub(r"#?\bshorts\b", "", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+if not IS_SHORT:
+    # Landscape render -> this is a normal video, not a Short. Don't let a
+    # leftover "shorts" hashtag/tag mislabel it.
+    HASHTAGS_TEXT = strip_shorts_word(HASHTAGS_TEXT)
+    RAW_TAGS = ",".join(t for t in RAW_TAGS.split(",") if t.strip().lower() != "shorts")
+elif "shorts" not in RAW_TAGS.lower():
+    RAW_TAGS = (RAW_TAGS + ",shorts").strip(",")
+
 full_description = f"{DESCRIPTION}\n\n{HASHTAGS_TEXT}".strip()
 
 
@@ -44,19 +67,16 @@ def sanitize_tags(raw_tags_str, max_total_chars=460):
         if not tag:
             continue
 
-        # Remove leading/embedded '#' and angle brackets YouTube rejects outright.
         tag = tag.replace("#", "").replace("<", "").replace(">", "").strip()
         if not tag:
             continue
 
-        # Guard against a single runaway/garbled tag eating the whole budget.
         tag = tag[:100]
 
         key = tag.lower()
         if key in seen:
             continue
 
-        # YouTube counts a tag with whitespace as if it were wrapped in quotes.
         tag_len = len(tag) + (2 if re.search(r"\s", tag) else 0)
         if total_len + tag_len > max_total_chars:
             break
@@ -69,6 +89,7 @@ def sanitize_tags(raw_tags_str, max_total_chars=460):
 
 
 TAGS = sanitize_tags(RAW_TAGS)
+print(f"Orientation: {ORIENTATION} | IS_SHORT: {IS_SHORT}")
 print(f"Raw VIDEO_TAGS input: {RAW_TAGS!r}")
 print(f"Sanitized tags being sent to YouTube ({len(TAGS)}): {TAGS}")
 
@@ -123,8 +144,6 @@ except HttpError as e:
         pass
 
     if reason == "invalidTags" and TAGS:
-        # Don't lose the whole video over bad tags - retry once with no tags
-        # so at least the upload succeeds; tags can be added manually after.
         print(f"YouTube rejected tags {TAGS} (invalidTags). Retrying with no tags...")
         try:
             response = upload([])
@@ -138,6 +157,7 @@ except HttpError as e:
 video_id = response.get("id")
 print("Upload complete. Video ID:", video_id)
 print("Privacy status used:", PRIVACY_STATUS)
+print("Rendered as:", "Short (vertical)" if IS_SHORT else "Regular video (landscape)")
 
 # Post an engagement comment on the freshly uploaded video.
 # Note: the YouTube Data API has no "pin comment" endpoint - pinning still

@@ -2,14 +2,18 @@ import os
 import google.oauth2.credentials
 import googleapiclient.discovery
 import googleapiclient.http
+from googleapiclient.errors import HttpError
 
 CLIENT_ID = os.environ["CLIENT_ID"]
 CLIENT_SECRET = os.environ["CLIENT_SECRET"]
 REFRESH_TOKEN = os.environ["REFRESH_TOKEN"]
-TITLE = os.environ.get("VIDEO_TITLE", "Untitled Short")
-DESCRIPTION = os.environ.get("VIDEO_DESCRIPTION", "")
+TITLE = os.environ.get("VIDEO_TITLE", "Untitled Short").strip()[:100]
+DESCRIPTION = os.environ.get("VIDEO_DESCRIPTION", "").strip()
+HASHTAGS_TEXT = os.environ.get("HASHTAGS_TEXT", "#news #uk #shorts").strip()
 TAGS = [t.strip() for t in os.environ.get("VIDEO_TAGS", "").split(",") if t.strip()]
 PRIVACY_STATUS = os.environ.get("PRIVACY_STATUS", "private")
+
+full_description = f"{DESCRIPTION}\n\n{HASHTAGS_TEXT}".strip()
 
 creds = google.oauth2.credentials.Credentials(
     None,
@@ -24,7 +28,7 @@ youtube = googleapiclient.discovery.build("youtube", "v3", credentials=creds)
 body = {
     "snippet": {
         "title": TITLE,
-        "description": DESCRIPTION + "\n\n#Shorts",
+        "description": full_description,
         "tags": TAGS,
         "categoryId": "25",  # News & Politics
     },
@@ -46,5 +50,18 @@ while response is None:
     if status:
         print(f"Uploaded {int(status.progress() * 100)}%")
 
-print("Upload complete. Video ID:", response.get("id"))
+video_id = response.get("id")
+print("Upload complete. Video ID:", video_id)
 print("Privacy status used:", PRIVACY_STATUS)
+
+# Try to set a custom thumbnail. This requires the channel to be phone-verified;
+# if it isn't, YouTube rejects this call - don't fail the whole run over it.
+if os.path.exists("thumbnail.jpg"):
+    try:
+        youtube.thumbnails().set(
+            videoId=video_id,
+            media_body=googleapiclient.http.MediaFileUpload("thumbnail.jpg", mimetype="image/jpeg"),
+        ).execute()
+        print("Custom thumbnail set successfully.")
+    except HttpError as e:
+        print("Could not set custom thumbnail (channel may need phone verification):", e)

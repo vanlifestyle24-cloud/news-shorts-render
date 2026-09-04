@@ -1,0 +1,64 @@
+name: Render and Upload Short
+
+on:
+  workflow_dispatch:
+    inputs:
+      audio_url:
+        description: 'URL of narration audio (mp3/wav)'
+        required: true
+      image_url:
+        description: 'URL of background image'
+        required: true
+      caption_text:
+        description: 'Text to overlay as captions on the video'
+        required: true
+      video_title:
+        description: 'YouTube video title'
+        required: true
+      video_description:
+        description: 'YouTube video description'
+        required: false
+        default: ''
+      video_tags:
+        description: 'Comma separated tags'
+        required: false
+        default: 'news,shorts,uk'
+
+jobs:
+  render-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install fonts
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
+
+      - name: Download assets
+        run: |
+          curl -L "${{ github.event.inputs.audio_url }}" -o narration.mp3
+          curl -L "${{ github.event.inputs.image_url }}" -o background.jpg
+
+      - name: Prepare caption file
+        run: |
+          cat > caption.txt << 'CAPEOF'
+          ${{ github.event.inputs.caption_text }}
+          CAPEOF
+
+      - name: Build vertical video with caption
+        run: |
+          ffmpeg -y -loop 1 -i background.jpg -i narration.mp3 \
+            -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,drawtext=textfile=caption.txt:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontcolor=white:fontsize=46:box=1:boxcolor=black@0.6:boxborderw=24:x=(w-text_w)/2:y=h-420:line_spacing=12" \
+            -c:v libx264 -c:a aac -pix_fmt yuv420p -shortest output.mp4
+
+      - name: Upload to YouTube
+        env:
+          CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          VIDEO_TITLE: ${{ github.event.inputs.video_title }}
+          VIDEO_DESCRIPTION: ${{ github.event.inputs.video_description }}
+          VIDEO_TAGS: ${{ github.event.inputs.video_tags }}
+        run: |
+          pip install --quiet google-auth google-auth-oauthlib google-api-python-client
+          python3 upload_youtube.py

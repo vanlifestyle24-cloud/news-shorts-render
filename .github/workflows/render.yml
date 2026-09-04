@@ -57,7 +57,6 @@ jobs:
             exit 1
           fi
 
-          # curl can return 200 with an HTML error page body - make sure this is really audio.
           if ! ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 narration.mp3 >/dev/null 2>&1; then
             echo "::error::Downloaded narration.mp3 is not a valid audio file. First 300 bytes of what we got:"
             head -c 300 narration.mp3
@@ -100,7 +99,6 @@ jobs:
             fi
           done < <(jq -r '.[]' media.json)
 
-          # remove any empty/failed downloads
           find media -type f -empty -delete
 
           COUNT=$(ls media/item_*.${EXT} 2>/dev/null | wc -l)
@@ -115,17 +113,61 @@ jobs:
           echo "MEDIA_COUNT=$COUNT" >> "$GITHUB_ENV"
           echo "Downloaded $COUNT ${MEDIA_TYPE} file(s)"
 
+      # ------------------------------------------------------------------
+      # NEW: figure out whether the source media is landscape or vertical,
+      # and pick the render target + Shorts/normal-video decision from that.
+      # Landscape source -> rendered landscape (1920x1080) -> normal video.
+      # Vertical/portrait source -> rendered vertical (1080x1920) -> Short.
+      # ------------------------------------------------------------------
+      - name: Detect media orientation
+        run: |
+          if [ "$MEDIA_TYPE" = "video" ]; then
+            SAMPLE=$(ls media/item_*.mp4 | head -n 1)
+          else
+            SAMPLE=$(ls media/item_*.jpg | head -n 1)
+          fi
+
+          DIMENSIONS=$(ffprobe -v error -select_streams v:0 \
+            -show_entries stream=width,height -of csv=s=x:p=0 "$SAMPLE")
+          WIDTH=$(echo "$DIMENSIONS" | cut -d'x' -f1)
+          HEIGHT=$(echo "$DIMENSIONS" | cut -d'x' -f2)
+          echo "Sample media: $SAMPLE (${WIDTH}x${HEIGHT})"
+
+          if [ "$HEIGHT" -ge "$WIDTH" ]; then
+            ORIENTATION="portrait"
+            TARGET_W=1080
+            TARGET_H=1920
+            IS_SHORT="true"
+          else
+            ORIENTATION="landscape"
+            TARGET_W=1920
+            TARGET_H=1080
+            IS_SHORT="false"
+          fi
+
+          echo "Orientation: $ORIENTATION -> render ${TARGET_W}x${TARGET_H}, IS_SHORT=$IS_SHORT"
+          echo "ORIENTATION=$ORIENTATION" >> "$GITHUB_ENV"
+          echo "TARGET_W=$TARGET_W" >> "$GITHUB_ENV"
+          echo "TARGET_H=$TARGET_H" >> "$GITHUB_ENV"
+          echo "IS_SHORT=$IS_SHORT" >> "$GITHUB_ENV"
+
       - name: Prepare caption file
         run: |
           cat > caption.txt << 'CAPEOF'
           ${{ github.event.inputs.caption_text }}
           CAPEOF
 
+      # ------------------------------------------------------------------
+      # Build one clip per media item at the orientation-correct resolution.
+      # Images get a slow Ken Burns zoom/pan instead of sitting static.
+      # ------------------------------------------------------------------
       - name: Build media segments
         run: |
           DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 narration.mp3)
           PER_ITEM=$(awk "BEGIN { printf \"%.3f\", $DURATION / $MEDIA_COUNT }")
-          echo "Audio duration: ${DURATION}s across $MEDIA_COUNT ${MEDIA_TYPE} item(s) = ${PER_ITEM}s each"
+          FPS=30
+          FRAMES=$(awk "BEGIN { printf \"%d\", $PER_ITEM * $FPS }")
+          echo "Audio duration: ${DURATION}s across $MEDIA_COUNT ${MEDIA_TYPE} item(s) = ${PER_ITEM}s (${FRAMES} frames) each"
 
           mkdir -p segments
           i=0
@@ -135,28 +177,93 @@ jobs:
               i=$((i+1))
               n=$(printf '%03d' "$i")
               ffmpeg -y -stream_loop -1 -i "$f" -t "$PER_ITEM" \
-                -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
-                -c:v libx264 -pix_fmt yuv420p -r 30 -an "segments/seg_${n}.mp4"
+                -vf "scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase,crop=${TARGET_W}:${TARGET_H}" \
+                -c:v libx264 -pix_fmt yuv420p -r $FPS -an "segments/seg_${n}.mp4"
             done
           else
+            # Oversample 2x before zoompan so the zoom doesn't look pixelated,
+            # then zoompan does a slow continuous zoom-in (Ken Burns effect).
+            OS_W=$((TARGET_W*2))
+            OS_H=$((TARGET_H*2))
             for f in media/item_*.jpg; do
               i=$((i+1))
               n=$(printf '%03d' "$i")
               ffmpeg -y -loop 1 -i "$f" -t "$PER_ITEM" \
-                -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
-                -c:v libx264 -pix_fmt yuv420p -r 30 "segments/seg_${n}.mp4"
+                -vf "scale=${OS_W}:${OS_H}:force_original_aspect_ratio=increase,crop=${OS_W}:${OS_H},zoompan=z='min(zoom+0.0015,1.3)':d=${FRAMES}:s=${TARGET_W}x${TARGET_H}:fps=${FPS},format=yuv420p" \
+                -c:v libx264 -pix_fmt yuv420p -r $FPS "segments/seg_${n}.mp4"
             done
           fi
 
-          for f in segments/seg_*.mp4; do echo "file '$f'"; done > concat_list.txt
+      # ------------------------------------------------------------------
+      # Replace the old hard-cut concat with crossfade transitions between
+      # slides ("slide animation") using ffmpeg's xfade filter, chained
+      # across however many segments we ended up with.
+      # ------------------------------------------------------------------
+      - name: Build transition script
+        run: |
+          cat > build_slideshow.py << 'PYEOF'
+          import subprocess, sys, glob
 
-      - name: Concatenate segments
-        run: ffmpeg -y -f concat -safe 0 -i concat_list.txt -c copy slideshow.mp4
+          def probe_duration(path):
+              out = subprocess.check_output([
+                  "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                  "-of", "default=noprint_wrappers=1:nokey=1", path
+              ]).decode().strip()
+              return float(out)
+
+          segments = sorted(glob.glob("segments/seg_*.mp4"))
+          if not segments:
+              print("No segments found"); sys.exit(1)
+
+          if len(segments) == 1:
+              subprocess.run(["cp", segments[0], "slideshow.mp4"], check=True)
+              sys.exit(0)
+
+          TRANSITIONS = ["fade", "wipeleft", "wiperight", "slideup", "slidedown",
+                         "circleopen", "circleclose", "smoothleft", "smoothright", "distance"]
+          XFADE_DUR = 0.6
+
+          durations = [probe_duration(s) for s in segments]
+
+          inputs = []
+          for s in segments:
+              inputs += ["-i", s]
+
+          filter_parts = []
+          prev_label = "0:v"
+          cumulative = durations[0]
+
+          for i in range(1, len(segments)):
+              d = max(0.1, min(XFADE_DUR, durations[i - 1], durations[i]))
+              offset = max(0.0, cumulative - d)
+              transition = TRANSITIONS[(i - 1) % len(TRANSITIONS)]
+              out_label = f"v{i}" if i < len(segments) - 1 else "vout"
+              filter_parts.append(
+                  f"[{prev_label}][{i}:v]xfade=transition={transition}:duration={d:.3f}:offset={offset:.3f}[{out_label}]"
+              )
+              cumulative = cumulative + durations[i] - d
+              prev_label = out_label
+
+          filter_complex = ";".join(filter_parts)
+
+          cmd = ["ffmpeg", "-y"] + inputs + [
+              "-filter_complex", filter_complex,
+              "-map", f"[{prev_label}]",
+              "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
+              "slideshow.mp4",
+          ]
+          print("Running:", " ".join(cmd))
+          subprocess.run(cmd, check=True)
+          PYEOF
+
+      - name: Render slideshow with crossfade transitions
+        run: python3 build_slideshow.py
 
       - name: Add narration and captions
         run: |
+          CAPTION_Y="h*0.78"
           ffmpeg -y -i slideshow.mp4 -i narration.mp3 \
-            -vf "drawtext=textfile=caption.txt:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontcolor=white:fontsize=50:box=1:boxcolor=black@0.55:boxborderw=22:shadowcolor=black@0.6:shadowx=2:shadowy=2:x=(w-text_w)/2:y=h-440:line_spacing=14" \
+            -vf "drawtext=textfile=caption.txt:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontcolor=white:fontsize=50:box=1:boxcolor=black@0.55:boxborderw=22:shadowcolor=black@0.6:shadowx=2:shadowy=2:x=(w-text_w)/2:y=${CAPTION_Y}:line_spacing=14" \
             -c:v libx264 -c:a aac -pix_fmt yuv420p -shortest output.mp4
 
       - name: Prepare title file (for thumbnail)
@@ -181,6 +288,8 @@ jobs:
           VIDEO_TAGS: ${{ github.event.inputs.video_tags }}
           HASHTAGS_TEXT: ${{ github.event.inputs.hashtags_text }}
           PRIVACY_STATUS: ${{ github.event.inputs.privacy_status }}
+          ORIENTATION: ${{ env.ORIENTATION }}
+          IS_SHORT: ${{ env.IS_SHORT }}
         run: |
           pip install --quiet google-auth google-auth-oauthlib google-api-python-client
           python3 upload_youtube.py

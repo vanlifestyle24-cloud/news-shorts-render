@@ -9,6 +9,7 @@ REFRESH_TOKEN = os.environ["REFRESH_TOKEN"]
 TITLE = os.environ.get("VIDEO_TITLE", "Untitled Short")
 DESCRIPTION = os.environ.get("VIDEO_DESCRIPTION", "")
 TAGS = [t.strip() for t in os.environ.get("VIDEO_TAGS", "").split(",") if t.strip()]
+PRIVACY_STATUS = os.environ.get("PRIVACY_STATUS", "private")
 
 creds = google.oauth2.credentials.Credentials(
     None,
@@ -28,7 +29,7 @@ body = {
         "categoryId": "25",  # News & Politics
     },
     "status": {
-        "privacyStatus": "public",
+        "privacyStatus": PRIVACY_STATUS,
         "selfDeclaredMadeForKids": False,
     },
 }
@@ -46,3 +47,4 @@ while response is None:
         print(f"Uploaded {int(status.progress() * 100)}%")
 
 print("Upload complete. Video ID:", response.get("id"))
+print("Privacy status used:", PRIVACY_STATUS)

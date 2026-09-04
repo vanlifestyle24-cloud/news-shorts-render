@@ -54,14 +54,23 @@ video_id = response.get("id")
 print("Upload complete. Video ID:", video_id)
 print("Privacy status used:", PRIVACY_STATUS)
 
-# Try to set a custom thumbnail. This requires the channel to be phone-verified;
-# if it isn't, YouTube rejects this call - don't fail the whole run over it.
-if os.path.exists("thumbnail.jpg"):
-    try:
-        youtube.thumbnails().set(
-            videoId=video_id,
-            media_body=googleapiclient.http.MediaFileUpload("thumbnail.jpg", mimetype="image/jpeg"),
-        ).execute()
-        print("Custom thumbnail set successfully.")
-    except HttpError as e:
-        print("Could not set custom thumbnail (channel may need phone verification):", e)
+# Post an engagement comment on the freshly uploaded video.
+# Note: the YouTube Data API has no "pin comment" endpoint - pinning still
+# requires one manual click in YouTube Studio (Comments -> ... -> Pin).
+try:
+    youtube.commentThreads().insert(
+        part="snippet",
+        body={
+            "snippet": {
+                "videoId": video_id,
+                "topLevelComment": {
+                    "snippet": {
+                        "textOriginal": "Thanks for watching! What's your take on this story? Let us know below 👇"
+                    }
+                },
+            }
+        },
+    ).execute()
+    print("Posted first comment. Pin it manually in YouTube Studio if you'd like it pinned.")
+except HttpError as e:
+    print("Could not post first comment (check OAuth scope includes youtube.force-ssl):", e)

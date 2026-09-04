@@ -6,8 +6,12 @@ on:
       audio_url:
         description: 'URL of narration audio (mp3/wav)'
         required: true
-      image_urls:
-        description: 'JSON array of image URLs, e.g. ["https://...","https://..."]'
+      media_type:
+        description: 'image or video'
+        required: true
+        default: 'image'
+      media_urls:
+        description: 'JSON array of media URLs, e.g. ["https://...","https://..."]'
         required: true
       caption_text:
         description: 'Text to overlay as captions on the video'
@@ -45,34 +49,46 @@ jobs:
       - name: Download narration audio
         run: curl -L "${{ github.event.inputs.audio_url }}" -o narration.mp3
 
-      - name: Save image URL list to file
+      - name: Save media URL list to file
         run: |
-          cat > images.json << 'IMGEOF'
-          ${{ github.event.inputs.image_urls }}
-          IMGEOF
+          cat > media.json << 'MEDEOF'
+          ${{ github.event.inputs.media_urls }}
+          MEDEOF
 
-      - name: Download all images
+      - name: Download all media
+        env:
+          MEDIA_TYPE: ${{ github.event.inputs.media_type }}
         run: |
-          mkdir -p images
+          mkdir -p media
           i=0
+
+          if [ "$MEDIA_TYPE" = "video" ]; then
+            EXT="mp4"
+          else
+            EXT="jpg"
+          fi
+
           while IFS= read -r url; do
             i=$((i+1))
             n=$(printf '%03d' "$i")
-            echo "Downloading image $n: $url"
-            curl -L -f -s "$url" -o "images/img_${n}.jpg" || echo "  (failed, skipping)"
-          done < <(jq -r '.[]' images.json)
+            echo "Downloading media $n: $url"
+            curl -L -f -s "$url" -o "media/item_${n}.${EXT}" || echo "  (failed, skipping)"
+          done < <(jq -r '.[]' media.json)
 
           # remove any empty/failed downloads
-          find images -type f -empty -delete
+          find media -type f -empty -delete
 
-          COUNT=$(ls images/*.jpg 2>/dev/null | wc -l)
+          COUNT=$(ls media/item_*.${EXT} 2>/dev/null | wc -l)
           if [ "$COUNT" -eq 0 ]; then
-            echo "No images downloaded successfully, using a fallback image"
-            curl -L "https://picsum.photos/1080/1920" -o images/img_001.jpg
+            echo "No media downloaded successfully, falling back to a still image"
+            curl -L "https://picsum.photos/1080/1920" -o media/item_001.jpg
+            MEDIA_TYPE="image"
             COUNT=1
           fi
-          echo "IMAGE_COUNT=$COUNT" >> "$GITHUB_ENV"
-          echo "Downloaded $COUNT image(s)"
+
+          echo "MEDIA_TYPE=$MEDIA_TYPE" >> "$GITHUB_ENV"
+          echo "MEDIA_COUNT=$COUNT" >> "$GITHUB_ENV"
+          echo "Downloaded $COUNT ${MEDIA_TYPE} file(s)"
 
       - name: Prepare caption file
         run: |
@@ -80,31 +96,36 @@ jobs:
           ${{ github.event.inputs.caption_text }}
           CAPEOF
 
-      - name: Prepare title file (for thumbnail)
-        run: |
-          cat > title.txt << 'TITLEEOF'
-          ${{ github.event.inputs.video_title }}
-          TITLEEOF
-
-      - name: Build image slideshow segments
+      - name: Build media segments
         run: |
           DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 narration.mp3)
-          PER_IMAGE=$(awk "BEGIN { printf \"%.3f\", $DURATION / $IMAGE_COUNT }")
-          echo "Audio duration: ${DURATION}s across $IMAGE_COUNT image(s) = ${PER_IMAGE}s each"
+          PER_ITEM=$(awk "BEGIN { printf \"%.3f\", $DURATION / $MEDIA_COUNT }")
+          echo "Audio duration: ${DURATION}s across $MEDIA_COUNT ${MEDIA_TYPE} item(s) = ${PER_ITEM}s each"
 
           mkdir -p segments
           i=0
-          for img in images/*.jpg; do
-            i=$((i+1))
-            n=$(printf '%03d' "$i")
-            ffmpeg -y -loop 1 -i "$img" -t "$PER_IMAGE" \
-              -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
-              -c:v libx264 -pix_fmt yuv420p -r 30 "segments/seg_${n}.mp4"
-          done
+
+          if [ "$MEDIA_TYPE" = "video" ]; then
+            for f in media/item_*.mp4; do
+              i=$((i+1))
+              n=$(printf '%03d' "$i")
+              ffmpeg -y -stream_loop -1 -i "$f" -t "$PER_ITEM" \
+                -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
+                -c:v libx264 -pix_fmt yuv420p -r 30 -an "segments/seg_${n}.mp4"
+            done
+          else
+            for f in media/item_*.jpg; do
+              i=$((i+1))
+              n=$(printf '%03d' "$i")
+              ffmpeg -y -loop 1 -i "$f" -t "$PER_ITEM" \
+                -vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920" \
+                -c:v libx264 -pix_fmt yuv420p -r 30 "segments/seg_${n}.mp4"
+            done
+          fi
 
           for f in segments/seg_*.mp4; do echo "file '$f'"; done > concat_list.txt
 
-      - name: Concatenate slideshow
+      - name: Concatenate segments
         run: ffmpeg -y -f concat -safe 0 -i concat_list.txt -c copy slideshow.mp4
 
       - name: Add narration and captions
@@ -113,9 +134,15 @@ jobs:
             -vf "drawtext=textfile=caption.txt:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontcolor=white:fontsize=50:box=1:boxcolor=black@0.55:boxborderw=22:shadowcolor=black@0.6:shadowx=2:shadowy=2:x=(w-text_w)/2:y=h-440:line_spacing=14" \
             -c:v libx264 -c:a aac -pix_fmt yuv420p -shortest output.mp4
 
+      - name: Prepare title file (for thumbnail)
+        run: |
+          cat > title.txt << 'TITLEEOF'
+          ${{ github.event.inputs.video_title }}
+          TITLEEOF
+
       - name: Generate thumbnail
         run: |
-          ffmpeg -y -i images/img_001.jpg \
+          ffmpeg -y -ss 1 -i slideshow.mp4 -frames:v 1 \
             -vf "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,drawtext=textfile=title.txt:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontcolor=white:fontsize=64:box=1:boxcolor=black@0.5:boxborderw=24:shadowcolor=black@0.7:shadowx=3:shadowy=3:x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=12" \
             thumbnail.jpg
 

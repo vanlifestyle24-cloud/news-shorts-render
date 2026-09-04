@@ -47,7 +47,25 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core ffmpeg jq
 
       - name: Download narration audio
-        run: curl -L "${{ github.event.inputs.audio_url }}" -o narration.mp3
+        run: |
+          http_code=$(curl -L -sS --retry 3 --retry-delay 3 --retry-connrefused \
+            -o narration.mp3 -w "%{http_code}" "${{ github.event.inputs.audio_url }}" || echo "000")
+          echo "Narration download HTTP status: $http_code"
+
+          if [ "$http_code" != "200" ]; then
+            echo "::error::Could not download narration audio from ${{ github.event.inputs.audio_url }} (HTTP $http_code). Is the edge-tts server up and reachable from the internet (not just your local network)?"
+            exit 1
+          fi
+
+          # curl can return 200 with an HTML error page body - make sure this is really audio.
+          if ! ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 narration.mp3 >/dev/null 2>&1; then
+            echo "::error::Downloaded narration.mp3 is not a valid audio file. First 300 bytes of what we got:"
+            head -c 300 narration.mp3
+            echo ""
+            exit 1
+          fi
+
+          echo "Narration audio OK ($(du -h narration.mp3 | cut -f1))"
 
       - name: Save media URL list to file
         run: |

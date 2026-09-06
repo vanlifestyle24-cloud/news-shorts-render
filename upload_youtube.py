@@ -15,29 +15,7 @@ HASHTAGS_TEXT = os.environ.get("HASHTAGS_TEXT", "#news #uk #shorts").strip()
 RAW_TAGS = os.environ.get("VIDEO_TAGS", "")
 PRIVACY_STATUS = os.environ.get("PRIVACY_STATUS", "private")
 
-# Set by the "Detect media orientation" step in render.yml. IS_SHORT is the
-# real signal: YouTube itself decides Shorts vs normal video purely from the
-# video's aspect ratio (vertical/square) and length - there's no API field
-# to force it - so all we control here is keeping the #shorts tag honest:
-# only claim "shorts" when the render actually came out vertical.
-ORIENTATION = os.environ.get("ORIENTATION", "portrait").strip().lower()
-IS_SHORT = os.environ.get("IS_SHORT", "true").strip().lower() == "true"
-
-
-def strip_shorts_word(text):
-    # remove any standalone "shorts"/"#shorts" token (case-insensitive)
-    text = re.sub(r"#?\bshorts\b", "", text, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-if not IS_SHORT:
-    # Landscape render -> this is a normal video, not a Short. Don't let a
-    # leftover "shorts" hashtag/tag mislabel it.
-    HASHTAGS_TEXT = strip_shorts_word(HASHTAGS_TEXT)
-    RAW_TAGS = ",".join(t for t in RAW_TAGS.split(",") if t.strip().lower() != "shorts")
-elif "shorts" not in RAW_TAGS.lower():
-    RAW_TAGS = (RAW_TAGS + ",shorts").strip(",")
-
+# Channel is landscape long-form only now (3-8 min videos) - no more Shorts.
 full_description = f"{DESCRIPTION}\n\n{HASHTAGS_TEXT}".strip()
 
 
@@ -89,7 +67,6 @@ def sanitize_tags(raw_tags_str, max_total_chars=460):
 
 
 TAGS = sanitize_tags(RAW_TAGS)
-print(f"Orientation: {ORIENTATION} | IS_SHORT: {IS_SHORT}")
 print(f"Raw VIDEO_TAGS input: {RAW_TAGS!r}")
 print(f"Sanitized tags being sent to YouTube ({len(TAGS)}): {TAGS}")
 
@@ -157,7 +134,25 @@ except HttpError as e:
 video_id = response.get("id")
 print("Upload complete. Video ID:", video_id)
 print("Privacy status used:", PRIVACY_STATUS)
-print("Rendered as:", "Short (vertical)" if IS_SHORT else "Regular video (landscape)")
+
+# ---------------------------------------------------------------------
+# Actually attach the generated thumbnail to the video. This step was
+# missing before - render.yml was creating thumbnail.jpg but nothing ever
+# called the API to set it, so YouTube just auto-picked a random frame.
+# ---------------------------------------------------------------------
+try:
+    if os.path.exists("thumbnail.jpg"):
+        youtube.thumbnails().set(
+            videoId=video_id,
+            media_body=googleapiclient.http.MediaFileUpload(
+                "thumbnail.jpg", mimetype="image/jpeg"
+            ),
+        ).execute()
+        print("Custom thumbnail set successfully.")
+    else:
+        print("No thumbnail.jpg found - skipping thumbnail upload.")
+except HttpError as e:
+    print("Could not set thumbnail (video still uploaded fine):", e)
 
 # Post an engagement comment on the freshly uploaded video.
 # Note: the YouTube Data API has no "pin comment" endpoint - pinning still

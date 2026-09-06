@@ -14,8 +14,9 @@ on:
         description: 'JSON array of media URLs, e.g. ["https://...","https://..."]'
         required: true
       caption_text:
-        description: 'Text to overlay as captions on the video'
-        required: true
+        description: 'Narration script (kept for reference only - no longer burned into the video as captions)'
+        required: false
+        default: ''
       video_title:
         description: 'YouTube video title (SEO)'
         required: true
@@ -26,11 +27,11 @@ on:
       video_tags:
         description: 'Comma separated tags (no # symbol)'
         required: false
-        default: 'news,shorts,uk'
+        default: 'news,uk'
       hashtags_text:
         description: 'Hashtags with # symbol, space separated, appended to description'
         required: false
-        default: '#news #uk #shorts'
+        default: '#news #uk'
       privacy_status:
         description: 'YouTube privacy status (private/unlisted/public)'
         required: false
@@ -114,48 +115,14 @@ jobs:
           echo "Downloaded $COUNT ${MEDIA_TYPE} file(s)"
 
       # ------------------------------------------------------------------
-      # NEW: figure out whether the source media is landscape or vertical,
-      # and pick the render target + Shorts/normal-video decision from that.
-      # Landscape source -> rendered landscape (1920x1080) -> normal video.
-      # Vertical/portrait source -> rendered vertical (1080x1920) -> Short.
+      # Channel is landscape long-form only now (3-8 min videos, no more
+      # Shorts) - always render at 1920x1080, no orientation detection
+      # needed.
       # ------------------------------------------------------------------
-      - name: Detect media orientation
+      - name: Set landscape render target
         run: |
-          if [ "$MEDIA_TYPE" = "video" ]; then
-            SAMPLE=$(ls media/item_*.mp4 | head -n 1)
-          else
-            SAMPLE=$(ls media/item_*.jpg | head -n 1)
-          fi
-
-          DIMENSIONS=$(ffprobe -v error -select_streams v:0 \
-            -show_entries stream=width,height -of csv=s=x:p=0 "$SAMPLE")
-          WIDTH=$(echo "$DIMENSIONS" | cut -d'x' -f1)
-          HEIGHT=$(echo "$DIMENSIONS" | cut -d'x' -f2)
-          echo "Sample media: $SAMPLE (${WIDTH}x${HEIGHT})"
-
-          if [ "$HEIGHT" -ge "$WIDTH" ]; then
-            ORIENTATION="portrait"
-            TARGET_W=1080
-            TARGET_H=1920
-            IS_SHORT="true"
-          else
-            ORIENTATION="landscape"
-            TARGET_W=1920
-            TARGET_H=1080
-            IS_SHORT="false"
-          fi
-
-          echo "Orientation: $ORIENTATION -> render ${TARGET_W}x${TARGET_H}, IS_SHORT=$IS_SHORT"
-          echo "ORIENTATION=$ORIENTATION" >> "$GITHUB_ENV"
-          echo "TARGET_W=$TARGET_W" >> "$GITHUB_ENV"
-          echo "TARGET_H=$TARGET_H" >> "$GITHUB_ENV"
-          echo "IS_SHORT=$IS_SHORT" >> "$GITHUB_ENV"
-
-      - name: Prepare caption file
-        run: |
-          cat > caption.txt << 'CAPEOF'
-          ${{ github.event.inputs.caption_text }}
-          CAPEOF
+          echo "TARGET_W=1920" >> "$GITHUB_ENV"
+          echo "TARGET_H=1080" >> "$GITHUB_ENV"
 
       # ------------------------------------------------------------------
       # Build one clip per media item at the orientation-correct resolution.
@@ -259,11 +226,9 @@ jobs:
       - name: Render slideshow with crossfade transitions
         run: python3 build_slideshow.py
 
-      - name: Add narration and captions
+      - name: Add narration (no burned-in captions)
         run: |
-          CAPTION_Y="h*0.78"
           ffmpeg -y -i slideshow.mp4 -i narration.mp3 \
-            -vf "drawtext=textfile=caption.txt:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontcolor=white:fontsize=50:box=1:boxcolor=black@0.55:boxborderw=22:shadowcolor=black@0.6:shadowx=2:shadowy=2:x=(w-text_w)/2:y=${CAPTION_Y}:line_spacing=14" \
             -c:v libx264 -c:a aac -pix_fmt yuv420p -shortest output.mp4
 
       - name: Prepare title file (for thumbnail)
@@ -274,9 +239,26 @@ jobs:
 
       - name: Generate thumbnail
         run: |
-          ffmpeg -y -ss 1 -i slideshow.mp4 -frames:v 1 \
+          # Grab the frame from ~15% into the video rather than a fixed 1s -
+          # avoids landing on a black frame or mid-crossfade transition,
+          # while still changing per topic since each video's content differs.
+          SLIDE_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 slideshow.mp4)
+          THUMB_TS=$(awk "BEGIN { printf \"%.2f\", $SLIDE_DURATION * 0.15 }")
+          echo "Grabbing thumbnail frame at ${THUMB_TS}s of ${SLIDE_DURATION}s"
+
+          ffmpeg -y -ss "$THUMB_TS" -i slideshow.mp4 -frames:v 1 \
             -vf "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,drawtext=textfile=title.txt:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:fontcolor=white:fontsize=64:box=1:boxcolor=black@0.5:boxborderw=24:shadowcolor=black@0.7:shadowx=3:shadowy=3:x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=12" \
             thumbnail.jpg
+
+      - name: Check video duration is in the 3-8 minute range
+        run: |
+          DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 output.mp4)
+          MIN=$(awk "BEGIN { print ($DUR >= 180) ? 1 : 0 }")
+          MAX=$(awk "BEGIN { print ($DUR <= 480) ? 1 : 0 }")
+          echo "Final video duration: ${DUR}s"
+          if [ "$MIN" -eq 0 ] || [ "$MAX" -eq 0 ]; then
+            echo "::warning::Video duration ${DUR}s is outside the target 180-480s (3-8 min) range - script length from n8n may need adjusting."
+          fi
 
       - name: Upload to YouTube
         env:
@@ -288,8 +270,6 @@ jobs:
           VIDEO_TAGS: ${{ github.event.inputs.video_tags }}
           HASHTAGS_TEXT: ${{ github.event.inputs.hashtags_text }}
           PRIVACY_STATUS: ${{ github.event.inputs.privacy_status }}
-          ORIENTATION: ${{ env.ORIENTATION }}
-          IS_SHORT: ${{ env.IS_SHORT }}
         run: |
           pip install --quiet google-auth google-auth-oauthlib google-api-python-client
           python3 upload_youtube.py

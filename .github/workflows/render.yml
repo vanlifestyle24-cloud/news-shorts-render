@@ -36,6 +36,14 @@ on:
         description: 'YouTube privacy status (private/unlisted/public)'
         required: false
         default: 'private'
+      cloudinary_public_id:
+        description: 'Cloudinary public_id of the temporary narration file to delete when done (leave blank to skip cleanup)'
+        required: false
+        default: ''
+      cloudinary_cloud_name:
+        description: 'Cloudinary cloud name the narration file was uploaded to'
+        required: false
+        default: ''
 
 jobs:
   render-and-upload:
@@ -273,3 +281,44 @@ jobs:
         run: |
           pip install --quiet google-auth google-auth-oauthlib google-api-python-client
           python3 upload_youtube.py
+
+      # ------------------------------------------------------------------
+      # Delete the temporary narration file from Cloudinary ourselves, right
+      # after we're done with it. This replaces relying on n8n's "Wait Before
+      # Cloudinary Cleanup" node to sit idle for 15 minutes and then fire a
+      # delete call - which only works if the n8n instance/process is still
+      # alive and that execution never got restarted or pruned in the
+      # meantime. Runs even if an earlier step failed (always()), and is a
+      # no-op if no public_id was passed in.
+      # ------------------------------------------------------------------
+      - name: Cleanup narration audio from Cloudinary
+        if: always()
+        env:
+          CLOUDINARY_PUBLIC_ID: ${{ github.event.inputs.cloudinary_public_id }}
+          CLOUDINARY_CLOUD_NAME: ${{ github.event.inputs.cloudinary_cloud_name }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+        run: |
+          if [ -z "$CLOUDINARY_PUBLIC_ID" ] || [ -z "$CLOUDINARY_CLOUD_NAME" ]; then
+            echo "No cloudinary_public_id/cloud_name provided - skipping cleanup."
+            exit 0
+          fi
+          if [ -z "$CLOUDINARY_API_KEY" ] || [ -z "$CLOUDINARY_API_SECRET" ]; then
+            echo "::warning::CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET repo secrets are not set - skipping cleanup. The n8n Wait node will still try to clean this up later as a fallback."
+            exit 0
+          fi
+
+          TIMESTAMP=$(date +%s)
+          TO_SIGN="public_id=${CLOUDINARY_PUBLIC_ID}&timestamp=${TIMESTAMP}${CLOUDINARY_API_SECRET}"
+          SIGNATURE=$(printf '%s' "$TO_SIGN" | openssl dgst -sha1 -hex | sed 's/^.*= *//')
+
+          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" -X POST \
+            "https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/raw/destroy" \
+            -d "public_id=${CLOUDINARY_PUBLIC_ID}" \
+            -d "api_key=${CLOUDINARY_API_KEY}" \
+            -d "timestamp=${TIMESTAMP}" \
+            -d "signature=${SIGNATURE}")
+
+          echo "Cloudinary destroy response (HTTP $HTTP_CODE):"
+          cat response.json
+          echo ""

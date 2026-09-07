@@ -1,10 +1,15 @@
 name: Render and Upload Short
 
+# Needed so the "Cleanup narration audio from repo" step at the end can
+# push a commit that deletes the temp audio file.
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
-      audio_url:
-        description: 'URL of narration audio (mp3/wav)'
+      audio_path:
+        description: 'Path (inside this repo) to the narration audio, e.g. narration-temp/1234-ab12.mp3. n8n must commit+push this file BEFORE dispatching this workflow.'
         required: true
       media_type:
         description: 'image or video'
@@ -36,14 +41,6 @@ on:
         description: 'YouTube privacy status (private/unlisted/public)'
         required: false
         default: 'private'
-      cloudinary_public_id:
-        description: 'Cloudinary public_id of the temporary narration file to delete when done (leave blank to skip cleanup)'
-        required: false
-        default: ''
-      cloudinary_cloud_name:
-        description: 'Cloudinary cloud name the narration file was uploaded to'
-        required: false
-        default: ''
 
 jobs:
   render-and-upload:
@@ -51,88 +48,58 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          # Full history (not the default shallow clone) so the cleanup
+          # step at the end of this job can safely commit + push without
+          # git complaining about a shallow repo.
+          fetch-depth: 0
 
       - name: Install fonts and ffmpeg
         run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core ffmpeg jq
 
-      - name: Download narration audio
+      # ------------------------------------------------------------------
+      # OLD APPROACH (removed): curl-download narration.mp3 from a
+      # Cloudinary URL, with retries + a 10s "CDN propagation" wait. This
+      # was fundamentally racy: Cloudinary is a temporary/expiring store,
+      # and if the runner was queued/delayed past the file's lifetime, the
+      # download would come back HTTP 200 with garbage/empty content
+      # (invalid audio) - which is exactly what failed in run #70.
+      #
+      # NEW APPROACH: n8n commits the narration file directly into this
+      # repo (path given via the audio_path input) and pushes it BEFORE
+      # dispatching this workflow. Because "Checkout repo" above pulls
+      # whatever is on the branch at trigger time, the file is already
+      # sitting on disk the moment this job starts - no network fetch, no
+      # expiry window, no race, regardless of how long the runner was
+      # queued.
+      # ------------------------------------------------------------------
+      - name: Validate narration audio (from repo)
+        env:
+          AUDIO_PATH: ${{ github.event.inputs.audio_path }}
         run: |
-          http_code=$(curl -L -sS --retry 3 --retry-delay 3 --retry-connrefused \
-            -o narration.mp3 -w "%{http_code}" "${{ github.event.inputs.audio_url }}" || echo "000")
-          echo "Narration download HTTP status: $http_code"
-
-          if [ "$http_code" != "200" ]; then
-            echo "::error::Could not download narration audio from ${{ github.event.inputs.audio_url }} (HTTP $http_code). Is the edge-tts server up and reachable from the internet (not just your local network)?"
+          if [ -z "$AUDIO_PATH" ]; then
+            echo "::error::No audio_path provided."
             exit 1
           fi
 
-          if ! ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 narration.mp3 >/dev/null 2>&1; then
-            echo "First attempt did not return valid audio - waiting 10s and retrying once (CDN propagation can lag right after upload)."
-            sleep 10
-            curl -L -sS --retry 3 --retry-delay 3 --retry-connrefused \
-              -o narration.mp3 "${{ github.event.inputs.audio_url }}" || true
+          if [ ! -f "$AUDIO_PATH" ]; then
+            echo "::error::Expected narration file at '$AUDIO_PATH' but it was not found in the checked-out repo."
+            echo "::error::Did n8n actually commit+push it to this branch BEFORE calling the workflow_dispatch API?"
+            echo "Repo contents of narration-temp/ (if it exists):"
+            ls -la narration-temp/ 2>/dev/null || echo "  (directory does not exist)"
+            exit 1
           fi
 
+          cp "$AUDIO_PATH" narration.mp3
+
           if ! ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 narration.mp3 >/dev/null 2>&1; then
-            echo "::error::Downloaded narration.mp3 is not a valid audio file. Content-Type and first 300 bytes of what we got:"
-            curl -sI -L "${{ github.event.inputs.audio_url }}" | grep -i content-type || true
+            echo "::error::'$AUDIO_PATH' was found but is not a valid audio file (first 300 bytes below). It may have been corrupted during the base64 commit step in n8n."
             head -c 300 narration.mp3
             echo ""
             exit 1
           fi
 
-          echo "Narration audio OK ($(du -h narration.mp3 | cut -f1))"
-
-      # ------------------------------------------------------------------
-      # Delete the temporary narration file from Cloudinary as soon as we
-      # have a good local copy on the runner - not 15 minutes later.
-      #
-      # Previously this cleanup only ran as the LAST step of the job, and
-      # n8n independently deleted the same file from Cloudinary 15 minutes
-      # after upload regardless of whether this workflow had even started
-      # yet. If the runner was queued/delayed (e.g. several renders
-      # triggered close together, as happens during manual testing) past
-      # that 15-minute mark, the "Download narration audio" step above
-      # would hit an already-deleted Cloudinary asset - which is what
-      # caused the "narration.mp3 is not a valid audio file" failures.
-      #
-      # Running cleanup right here, immediately after a verified-good
-      # download, removes that race entirely: we only ever delete the
-      # Cloudinary copy once we no longer need it, no timer involved.
-      # n8n's own wait-then-delete step remains as a fallback safety net
-      # in case this job fails before reaching this point.
-      # ------------------------------------------------------------------
-      - name: Cleanup narration audio from Cloudinary (early)
-        if: always()
-        env:
-          CLOUDINARY_PUBLIC_ID: ${{ github.event.inputs.cloudinary_public_id }}
-          CLOUDINARY_CLOUD_NAME: ${{ github.event.inputs.cloudinary_cloud_name }}
-          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
-          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
-        run: |
-          if [ -z "$CLOUDINARY_PUBLIC_ID" ] || [ -z "$CLOUDINARY_CLOUD_NAME" ]; then
-            echo "No cloudinary_public_id/cloud_name provided - skipping cleanup."
-            exit 0
-          fi
-          if [ -z "$CLOUDINARY_API_KEY" ] || [ -z "$CLOUDINARY_API_SECRET" ]; then
-            echo "::warning::CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET repo secrets are not set - skipping early cleanup. n8n's own wait-then-delete step will still clean this up later."
-            exit 0
-          fi
-
-          TIMESTAMP=$(date +%s)
-          TO_SIGN="public_id=${CLOUDINARY_PUBLIC_ID}&timestamp=${TIMESTAMP}${CLOUDINARY_API_SECRET}"
-          SIGNATURE=$(printf '%s' "$TO_SIGN" | openssl dgst -sha1 -hex | sed 's/^.*= *//')
-
-          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" -X POST \
-            "https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/raw/destroy" \
-            -d "public_id=${CLOUDINARY_PUBLIC_ID}" \
-            -d "api_key=${CLOUDINARY_API_KEY}" \
-            -d "timestamp=${TIMESTAMP}" \
-            -d "signature=${SIGNATURE}")
-
-          echo "Cloudinary destroy response (HTTP $HTTP_CODE):"
-          cat response.json
-          echo ""
+          echo "Narration audio OK ($(du -h narration.mp3 | cut -f1)) from $AUDIO_PATH"
 
       - name: Save media URL list to file
         run: |
@@ -341,6 +308,47 @@ jobs:
           pip install --quiet google-auth google-auth-oauthlib google-api-python-client
           python3 upload_youtube.py
 
-      # Cloudinary cleanup now happens right after the "Download narration
-      # audio" step above (as soon as we have a verified local copy), not
-      # here at the end - see the comment there for why.
+      # ------------------------------------------------------------------
+      # Remove the temp narration file from the repo now that the video
+      # has been uploaded (runs even if an earlier step failed, so we
+      # don't leave orphaned audio files behind on failed runs either).
+      #
+      # This pushes a small commit deleting the one file - it does NOT
+      # rewrite git history, so the blob technically still exists in past
+      # commits. For small TTS audio files at a few-videos-per-day
+      # cadence this is not a practical problem, but if repo size ever
+      # becomes a concern, periodically run `git gc` / BFG Repo-Cleaner,
+      # or switch narration-temp/ to a short-lived orphan branch instead
+      # of main.
+      # ------------------------------------------------------------------
+      - name: Cleanup narration audio from repo
+        if: always()
+        env:
+          AUDIO_PATH: ${{ github.event.inputs.audio_path }}
+        run: |
+          if [ -z "$AUDIO_PATH" ] || [ ! -f "$AUDIO_PATH" ]; then
+            echo "Nothing to clean up at '$AUDIO_PATH'."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${{ github.ref_name }}"
+          git rm -f "$AUDIO_PATH"
+          git commit -m "chore: remove processed narration audio ($AUDIO_PATH) [skip ci]"
+
+          # Other renders may finish around the same time and push their
+          # own cleanup commits to the same branch - retry with rebase on
+          # conflict instead of failing the whole (already-successful) run.
+          for i in 1 2 3; do
+            if git push origin "HEAD:${BRANCH}"; then
+              echo "Cleanup pushed successfully."
+              exit 0
+            fi
+            echo "Push failed (attempt $i) - fetching and rebasing, then retrying..."
+            git fetch origin "${BRANCH}"
+            git rebase "origin/${BRANCH}" || { git rebase --abort; break; }
+            sleep 3
+          done
+          echo "::warning::Could not push cleanup commit for $AUDIO_PATH after 3 attempts. The temp file will remain in the repo until manually removed or cleaned up by a later run."

@@ -321,6 +321,23 @@ jobs:
       # or switch narration-temp/ to a short-lived orphan branch instead
       # of main.
       # ------------------------------------------------------------------
+      - name: Report result to Shorts API
+        if: always()
+        run: |
+          # Report video status back to shorts system
+          STATUS="failed"
+          REASON="render pipeline failed"
+          if [ "${{ job.status }}" = "success" ]; then
+            STATUS="uploaded"
+            REASON="render and upload completed"
+          fi
+          echo "Reporting: $STATUS ($REASON)"
+          # Try shorts API (best effort - won't fail the job if unreachable)
+          curl -s -X POST "https://shorts.145.241.235.134.nip.io/report/record" \
+            -H "Content-Type: application/json" \
+            -d "{\"topic_id\": 0, \"title\": \"${{ github.event.inputs.video_title }}\", \"status\": \"$STATUS\", \"reason\": \"$REASON\"}" \
+            --max-time 5 || echo "shorts-api unreachable (ok - best effort)"
+
       - name: Cleanup narration audio from repo
         if: always()
         env:

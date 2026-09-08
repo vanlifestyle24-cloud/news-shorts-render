@@ -1,0 +1,42 @@
+name: Shorts Manager
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic_id:
+        description: 'Topic ID from queue (empty = auto-pick next)'
+        required: false
+        default: ''
+      count:
+        description: 'Videos to make (1-10)'
+        required: false
+        default: '1'
+
+jobs:
+  shorts-manager:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch next topic(s)
+        id: topic
+        run: |
+          # Try configured topic, else auto-pick from shorts API
+          TOPIC_ID="${{ github.event.inputs.topic_id }}"
+          COUNT="${{ github.event.inputs.count }}"
+          echo "count=$COUNT" >> "$GITHUB_ENV"
+          if [ -n "$TOPIC_ID" ]; then
+            # Get topic from API by id
+            curl -s "http://145.241.235.134.nip.io:8095/topic/next" 2>/dev/null || true
+          fi
+          # For now: pick from a simple embedded queue passed via dispatch
+          echo "Topic picking configured via shorts-api (or manual dispatch)"
+
+      - name: Report attempt to shorts API
+        run: |
+          # Call back to shorts-api server to record attempt
+          curl -s -X POST http://145.241.235.134.nip.io:8095/report/record \
+            -H "Content-Type: application/json" \
+            -d '{"title": "Shorts Manager run", "status": "started", "reason": "workflow started"}' || \
+            echo "shorts-api unreachable from runner (expected if not exposed)"

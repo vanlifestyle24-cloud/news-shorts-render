@@ -1,0 +1,138 @@
+name: YouTube Control
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action: channel-stats | list-videos | test-upload | video-info'
+        required: true
+        default: 'channel-stats'
+      video_id:
+        description: 'YouTube video ID (for video-info action)'
+        required: false
+        default: ''
+      test_title:
+        description: 'Test upload title (for test-upload action)'
+        required: false
+        default: 'Test upload from GitHub Actions'
+
+jobs:
+  youtube-control:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install YouTube API libraries
+        run: pip install --quiet google-auth google-auth-oauthlib google-api-python-client
+
+      - name: Run YouTube control action
+        env:
+          CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          ACTION: ${{ github.event.inputs.action }}
+          VIDEO_ID: ${{ github.event.inputs.video_id }}
+          TEST_TITLE: ${{ github.event.inputs.test_title }}
+        run: |
+          python3 << 'PYEOF'
+          import os, json, sys
+          import google.oauth2.credentials
+          import googleapiclient.discovery
+
+          CLIENT_ID = os.environ["CLIENT_ID"]
+          CLIENT_SECRET = os.environ["CLIENT_SECRET"]
+          REFRESH_TOKEN = os.environ["REFRESH_TOKEN"]
+          ACTION = os.environ.get("ACTION", "channel-stats")
+          VIDEO_ID = os.environ.get("VIDEO_ID", "")
+
+          creds = google.oauth2.credentials.Credentials(
+              None,
+              refresh_token=REFRESH_TOKEN,
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=CLIENT_ID,
+              client_secret=CLIENT_SECRET,
+          )
+
+          yt = googleapiclient.discovery.build("youtube", "v3", credentials=creds)
+
+          if ACTION == "channel-stats":
+              # Get the channel associated with these credentials
+              resp = yt.channels().list(part="snippet,statistics", mine=True).execute()
+              for ch in resp.get("items", []):
+                  print(f"=== CHANNEL: {ch['snippet']['title']} ===")
+                  print(f"  ID: {ch['id']}")
+                  print(f"  Subscribers: {ch['statistics'].get('subscriberCount', 'N/A')}")
+                  print(f"  Videos: {ch['statistics'].get('videoCount', 'N/A')}")
+                  print(f"  Views: {ch['statistics'].get('viewCount', 'N/A')}")
+                  print(f"  Country: {ch['snippet'].get('country', 'N/A')}")
+                  print(f"  Created: {ch['snippet'].get('publishedAt', 'N/A')}")
+
+          elif ACTION == "list-videos":
+              resp = yt.search().list(part="snippet", forMine=True, type="video", maxResults=20).execute()
+              print(f"=== LATEST VIDEOS ({len(resp.get('items', []))}) ===")
+              for item in resp.get("items", []):
+                  vid = item["id"]["videoId"]
+                  title = item["snippet"]["title"]
+                  published = item["snippet"]["publishedAt"]
+                  print(f"  {vid} | {published} | {title}")
+
+          elif ACTION == "video-info":
+              if not VIDEO_ID:
+                  print("ERROR: video_id input required for video-info action")
+                  sys.exit(1)
+              resp = yt.videos().list(part="snippet,statistics", id=VIDEO_ID).execute()
+              for v in resp.get("items", []):
+                  print(f"=== VIDEO: {v['snippet']['title']} ===")
+                  print(f"  ID: {v['id']}")
+                  print(f"  Views: {v['statistics'].get('viewCount', '0')}")
+                  print(f"  Likes: {v['statistics'].get('likeCount', '0')}")
+                  print(f"  Comments: {v['statistics'].get('commentCount', '0')}")
+                  print(f"  Published: {v['snippet']['publishedAt']}")
+
+          elif ACTION == "test-upload":
+              # Upload a tiny test video to verify credentials work
+              import subprocess, tempfile, os
+              # Create a 2-second test video with ffmpeg
+              with tempfile.TemporaryDirectory() as td:
+                  video_path = os.path.join(td, "test.mp4")
+                  subprocess.run([
+                      "ffmpeg", "-y", "-f", "lavfi",
+                      "-i", "testsrc=duration=2:size=640x360:rate=30",
+                      "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                      "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                      "-c:a", "aac", "-shortest", video_path
+                  ], check=True, capture_output=True)
+
+                  import googleapiclient.http
+                  body = {
+                      "snippet": {
+                          "title": os.environ.get("TEST_TITLE", "Test upload from GitHub Actions"),
+                          "description": "Test upload to verify YouTube API credentials work.",
+                          "tags": ["test", "automation"]
+                      },
+                      "status": {"privacyStatus": "private"}
+                  }
+                  media = googleapiclient.http.MediaFileUpload(video_path, chunksize=-1, resumable=True)
+                  request = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+                  response = None
+                  while response is None:
+                      status, response = request.next_chunk()
+                      if status:
+                          print(f"  Upload progress: {int(status.progress() * 100)}%")
+                  vid = response.get("id")
+                  print(f"=== TEST UPLOAD SUCCESSFUL ===")
+                  print(f"  Video ID: {vid}")
+                  print(f"  URL: https://youtu.be/{vid}")
+                  print(f"  Privacy: private (not visible to public)")
+
+          else:
+              print(f"ERROR: Unknown action '{ACTION}'")
+              print("Valid actions: channel-stats, list-videos, test-upload, video-info")
+              sys.exit(1)
+          PYEOF
